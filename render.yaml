@@ -4,8 +4,8 @@ services:
     runtime: node
     plan: free
     branch: main
-    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
-    startCommand: pnpm start
+    buildCommand: corepack prepare pnpm@9.15.9 --activate && corepack pnpm install --frozen-lockfile && corepack pnpm build
+    startCommand: corepack pnpm start
     autoDeploy: true
     envVars:
       - key: NODE_VERSION

@@ -138,6 +138,22 @@ class HermesAgent(Agent):
         )
         return ""
 
+def message_text(msg: Any) -> str:
+    """Extract text from a LiveKit ChatMessage-ish object."""
+    text = getattr(msg, "text_content", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    content = getattr(msg, "content", None)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [part for part in content if isinstance(part, str) and part.strip()]
+        if parts:
+            return "\n".join(parts).strip()
+    return ""
+
+
+def latest_user_text(chat_ctx: Any) -> str:
     """Extract the latest user message from LiveKit ChatContext without tight coupling."""
     try:
         messages = chat_ctx.messages()

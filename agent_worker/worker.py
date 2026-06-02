@@ -70,6 +70,7 @@ class HermesAgent(Agent):
         )
         self.bridge = HermesBridge()
         self.room_name: str | None = None
+        self._directly_handled_turns: set[str] = set()
 
     async def on_enter(self) -> None:
         logger.info("agent entered room", extra={"room": self.room_name})
@@ -90,42 +91,63 @@ class HermesAgent(Agent):
                 "message_type": type(new_message).__name__,
             },
         )
+        if not text:
+            return
 
-    def llm_node(self, chat_ctx: Any, tools: list[Any], model_settings: Any):
-        """Replace the default LLM with a Hermes API call.
+        # Deterministic voice path: call Hermes directly here and explicitly
+        # speak the response. The normal llm_node/TTS pipeline was returning
+        # text to Telegram, but not reliably producing audio in this custom
+        # bridge setup.
+        self._directly_handled_turns.add(text)
+        try:
+            logger.info("calling Hermes API directly from completed turn", extra={"room": self.room_name, "text_len": len(text)})
+            response = await asyncio.to_thread(self.bridge.ask, text, room_name=self.room_name)
+            logger.info("Hermes direct turn returned", extra={"room": self.room_name, "response_len": len(response)})
+        except HermesBridgeError as exc:
+            logger.exception("Hermes API bridge error in direct turn")
+            response = f"I heard you, but Hermes returned an error: {exc}"
+        except Exception as exc:  # pragma: no cover - defensive runtime boundary
+            logger.exception("unexpected Hermes bridge failure in direct turn")
+            response = f"I heard you, but could not contact Hermes: {exc}"
 
-        LiveKit calls this after a finalized user turn. It must return an async
-        iterable of strings/chunks. We extract the latest user text from the
-        LiveKit chat context, send it to Hermes, then yield Hermes' response for
-        TTS and transcript forwarding.
-        """
-
-        async def stream():
-            user_text = latest_user_text(chat_ctx)
-            logger.info(
-                "llm_node invoked",
-                extra={"room": self.room_name, "text_len": len(user_text), "text_preview": user_text[:160]},
-            )
-            if not user_text:
-                yield "I didn't catch that. Could you repeat it?"
-                return
-
+        if response:
             try:
-                logger.info("calling Hermes API", extra={"room": self.room_name, "text_len": len(user_text)})
-                response = await asyncio.to_thread(self.bridge.ask, user_text, room_name=self.room_name)
-                logger.info("Hermes API returned", extra={"room": self.room_name, "response_len": len(response)})
-            except HermesBridgeError as exc:
-                logger.exception("Hermes API bridge error")
-                yield f"I reached the voice room, but Hermes returned an error: {exc}"
-                return
-            except Exception as exc:  # pragma: no cover - defensive runtime boundary
-                logger.exception("unexpected Hermes bridge failure")
-                yield f"I reached the voice room, but could not contact Hermes: {exc}"
-                return
+                logger.info("speaking Hermes direct response", extra={"room": self.room_name, "response_len": len(response)})
+                await self.session.say(response, allow_interruptions=False, add_to_chat_ctx=True)
+            except Exception:
+                logger.exception("failed to speak Hermes direct response")
 
-            yield response or "Hermes returned an empty response."
+    async def llm_node(self, chat_ctx: Any, tools: list[Any], model_settings: Any) -> str:
+        """Fallback LLM hook.
 
-        return stream()
+        on_user_turn_completed handles the real Hermes call and audio output.
+        LiveKit still invokes llm_node after that, so suppress duplicate turns
+        where possible.
+        """
+        user_text = latest_user_text(chat_ctx)
+        logger.info(
+            "llm_node invoked",
+            extra={"room": self.room_name, "text_len": len(user_text), "text_preview": user_text[:160]},
+        )
+        if user_text in self._directly_handled_turns:
+            logger.info("llm_node suppressed duplicate handled turn", extra={"room": self.room_name, "text_len": len(user_text)})
+            self._directly_handled_turns.discard(user_text)
+            return ""
+        if not user_text:
+            return "I didn't catch that. Could you repeat it?"
+
+        try:
+            logger.info("calling Hermes API from llm_node fallback", extra={"room": self.room_name, "text_len": len(user_text)})
+            response = await asyncio.to_thread(self.bridge.ask, user_text, room_name=self.room_name)
+            logger.info("Hermes fallback returned", extra={"room": self.room_name, "response_len": len(response)})
+        except HermesBridgeError as exc:
+            logger.exception("Hermes API bridge error")
+            return f"I reached the voice room, but Hermes returned an error: {exc}"
+        except Exception as exc:  # pragma: no cover - defensive runtime boundary
+            logger.exception("unexpected Hermes bridge failure")
+            return f"I reached the voice room, but could not contact Hermes: {exc}"
+
+        return response or "Hermes returned an empty response."
 
 
 def message_text(msg: Any) -> str:

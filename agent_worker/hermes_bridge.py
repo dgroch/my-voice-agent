@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
@@ -76,6 +77,7 @@ class HermesBridge:
             "message": text,
             "instructions": instructions,
         }
+        self._mirror_to_telegram(f"🎙️ Voice input: {text}")
         url = f"{self.config.api_url}/api/sessions/{self.config.session_id}/chat"
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
@@ -104,7 +106,40 @@ class HermesBridge:
         content = message.get("content") or data.get("content") or ""
         if not isinstance(content, str):
             content = str(content)
-        return content.strip()
+        content = content.strip()
+        if content:
+            self._mirror_to_telegram(f"🔊 Hermes voice reply: {content}")
+        return content
+
+    def _mirror_to_telegram(self, message: str) -> None:
+        """Best-effort visible mirror into Daniel's Telegram DM.
+
+        This is intentionally non-fatal: voice should keep working even if the
+        Telegram mirror token/chat id is absent or Telegram is temporarily down.
+        """
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        chat_id = os.environ.get("HERMES_TELEGRAM_CHAT_ID") or _chat_id_from_session_key(self.config.session_key)
+        if not token or not chat_id:
+            return
+        payload = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode("utf-8")
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            method="POST",
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                response.read()
+        except Exception:
+            return
+
+
+def _chat_id_from_session_key(session_key: str | None) -> str | None:
+    if not session_key or not session_key.startswith("telegram:"):
+        return None
+    parts = session_key.split(":")
+    return parts[1] if len(parts) >= 2 and parts[1] else None
 
 
 def main() -> int:

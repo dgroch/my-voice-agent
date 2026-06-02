@@ -22,17 +22,40 @@ Optional env:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
-from livekit.agents import Agent, AgentServer, AgentSession, JobContext, cli, inference
+from livekit.agents import Agent, AgentServer, AgentSession, JobContext, RoomInputOptions, cli, inference, llm
 from livekit.plugins import silero
+
+logger = logging.getLogger("hermes_voice_bridge")
 
 # Allow `python agent_worker/worker.py ...` from repo root.
 sys.path.append(str(Path(__file__).resolve().parent))
 from hermes_bridge import HermesBridge, HermesBridgeError  # noqa: E402
+
+
+class HermesPlaceholderLLM(llm.LLM):
+    """Non-answering LLM marker so LiveKit runs Agent.llm_node().
+
+    LiveKit 1.5 requires an LLM object before it will generate a reply, even
+    when the Agent overrides llm_node(). This class should never be asked to
+    chat; HermesAgent.llm_node is the real generation path.
+    """
+
+    @property
+    def model(self) -> str:
+        return "hermes-director-api"
+
+    @property
+    def provider(self) -> str:
+        return "hermes"
+
+    def chat(self, **_: Any) -> Any:
+        raise RuntimeError("HermesPlaceholderLLM.chat should not be called; HermesAgent.llm_node handles generation")
 
 
 class HermesAgent(Agent):
@@ -42,17 +65,31 @@ class HermesAgent(Agent):
                 "You are a thin voice transport for Daniel's Hermes Director profile. "
                 "Do not answer from this LiveKit agent's own knowledge. The llm_node sends "
                 "each user turn to Hermes and speaks the returned Hermes response."
-            )
+            ),
+            llm=HermesPlaceholderLLM(),
         )
         self.bridge = HermesBridge()
         self.room_name: str | None = None
 
     async def on_enter(self) -> None:
+        logger.info("agent entered room", extra={"room": self.room_name})
         try:
             await self.session.say("Hermes voice bridge is connected.", allow_interruptions=True)
         except Exception:
             # Greeting is non-critical; avoid failing room join because TTS hiccuped.
-            pass
+            logger.exception("failed to say greeting")
+
+    async def on_user_turn_completed(self, turn_ctx: Any, new_message: Any) -> None:
+        text = message_text(new_message)
+        logger.info(
+            "user turn completed",
+            extra={
+                "room": self.room_name,
+                "text_len": len(text),
+                "text_preview": text[:160],
+                "message_type": type(new_message).__name__,
+            },
+        )
 
     def llm_node(self, chat_ctx: Any, tools: list[Any], model_settings: Any):
         """Replace the default LLM with a Hermes API call.
@@ -65,22 +102,45 @@ class HermesAgent(Agent):
 
         async def stream():
             user_text = latest_user_text(chat_ctx)
+            logger.info(
+                "llm_node invoked",
+                extra={"room": self.room_name, "text_len": len(user_text), "text_preview": user_text[:160]},
+            )
             if not user_text:
                 yield "I didn't catch that. Could you repeat it?"
                 return
 
             try:
+                logger.info("calling Hermes API", extra={"room": self.room_name, "text_len": len(user_text)})
                 response = await asyncio.to_thread(self.bridge.ask, user_text, room_name=self.room_name)
+                logger.info("Hermes API returned", extra={"room": self.room_name, "response_len": len(response)})
             except HermesBridgeError as exc:
+                logger.exception("Hermes API bridge error")
                 yield f"I reached the voice room, but Hermes returned an error: {exc}"
                 return
             except Exception as exc:  # pragma: no cover - defensive runtime boundary
+                logger.exception("unexpected Hermes bridge failure")
                 yield f"I reached the voice room, but could not contact Hermes: {exc}"
                 return
 
             yield response or "Hermes returned an empty response."
 
         return stream()
+
+
+def message_text(msg: Any) -> str:
+    """Extract text from a LiveKit ChatMessage-ish object."""
+    text = getattr(msg, "text_content", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    content = getattr(msg, "content", None)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [part for part in content if isinstance(part, str) and part.strip()]
+        if parts:
+            return "\n".join(parts).strip()
+    return ""
 
 
 def latest_user_text(chat_ctx: Any) -> str:
@@ -93,16 +153,9 @@ def latest_user_text(chat_ctx: Any) -> str:
     for msg in reversed(messages):
         if getattr(msg, "role", None) != "user":
             continue
-        text = getattr(msg, "text_content", None)
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-        content = getattr(msg, "content", None)
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            parts = [part for part in content if isinstance(part, str) and part.strip()]
-            if parts:
-                return "\n".join(parts).strip()
+        text = message_text(msg)
+        if text:
+            return text
     return ""
 
 
@@ -122,7 +175,38 @@ async def hermes_voice_session(ctx: JobContext):
         ),
         vad=silero.VAD.load(),
     )
-    await session.start(room=ctx.room, agent=agent)
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(ev: Any) -> None:
+        transcript = getattr(ev, "transcript", "") or ""
+        logger.info(
+            "user input transcribed",
+            extra={
+                "room": agent.room_name,
+                "is_final": getattr(ev, "is_final", None),
+                "transcript_len": len(transcript),
+                "transcript_preview": transcript[:160],
+            },
+        )
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(ev: Any) -> None:
+        item = getattr(ev, "item", None)
+        logger.info(
+            "conversation item added",
+            extra={
+                "room": agent.room_name,
+                "role": getattr(item, "role", None),
+                "text_len": len(message_text(item)) if item is not None else 0,
+                "text_preview": message_text(item)[:160] if item is not None else "",
+            },
+        )
+
+    @session.on("error")
+    def _on_error(ev: Any) -> None:
+        logger.error("agent session error", extra={"room": agent.room_name, "event": repr(ev)})
+
+    await session.start(room=ctx.room, agent=agent, room_input_options=RoomInputOptions(audio_enabled=True, text_enabled=True))
 
 
 if __name__ == "__main__":

@@ -67,8 +67,9 @@ class HermesBridge:
 
         instructions = (
             "This message came from Daniel speaking through the LiveKit voice app. "
-            "Treat it as part of the same Telegram conversation/session. Reply naturally for voice: "
-            "be concise when possible, but use Hermes tools when needed."
+            "Reply naturally for voice: be concise when possible, but use Hermes tools when needed. "
+            "This voice worker uses a dedicated Hermes API session to avoid deadlocking the active Telegram turn; "
+            "final voice turns may also be mirrored into Telegram for visibility."
         )
         if room_name:
             instructions += f" LiveKit room: {room_name}."

@@ -22,5 +22,5 @@ services:
         sync: false
       - key: TELEGRAM_MESSAGE_THREAD_ID
         sync: false
-      - key: AGENT_NAME
-        value: my-hermes-agent
+      - key: LIVEKIT_AGENT
+        sync: false
